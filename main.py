@@ -1,4 +1,3 @@
-import cv2
 import cv2 as cv
 import numpy as np
 
@@ -7,7 +6,7 @@ from matplotlib import pyplot as plt
 def fb_field_detector(filename: str) -> None:
     img_bgr = cv.imread(filename)
     assert img_bgr is not None, "File not found."
-    img = cv2.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
+    img = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
     plt.imshow(img); plt.axis('off'); plt.title('Source picture')
     # plt.show()
     hsv = cv.cvtColor(img, cv.COLOR_RGB2HSV)
