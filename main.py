@@ -3,8 +3,8 @@ import cv2 as cv
 import numpy as np
 
 # -------- Tunables (kept as constants for clarity) --------
-GREEN_HSV_LOW  = (35, 55, 35)    # green gate in HSV
-GREEN_HSV_HIGH = (100, 255, 255)
+GREEN_HSV_LOW  = (30, 45, 35)    # green gate in HSV (slightly wider to catch shaded turf)
+GREEN_HSV_HIGH = (102, 255, 255)
 WHITE_HSV_LOW  = (0, 0, 175)     # white border (faint to bright)
 WHITE_HSV_HIGH = (180, 85, 255)
 BARRIER_KSIZE  = (3, 3)          # thickness of the 'moat' around white line
@@ -12,6 +12,9 @@ EXG_BANDS      = 30              # horizontal bands for Otsu per band
 BOTTOM_CUT_R   = 0.97            # cut a bottom strip to avoid floor leak
 CLAHE_CLIP     = 2.5             # V-channel equalization
 CLAHE_TILE     = (8, 8)
+FENCE_CLOSE_W  = 0.018           # width (ratio) of closing kernel to overcome vertical fence bars
+FENCE_CLOSE_H  = 0.010           # height (ratio) of closing kernel
+HOLE_FILL_R    = 0.002           # max ratio of holes inside the field mask to auto-fill
 
 # -------- Small helpers --------
 def kpercent(w: int, h: int, wr: float, hr: float, ellipse=False):
@@ -51,12 +54,33 @@ def green_mask(img_rgb: np.ndarray) -> np.ndarray:
         mask_exg[y0:y1, :] = (exg_u8[y0:y1, :] > thr).astype(np.uint8) * 255
 
     lab = cv.cvtColor(img_rgb, cv.COLOR_RGB2Lab)
-    lab_gate = cv.inRange(lab, (0, 0, 120), (255, 118, 165))
+    lab_gate = cv.inRange(lab, (0, 88, 118), (255, 140, 182))
 
     base = cv.bitwise_and(hsv_gate, mask_exg)
     base = cv.bitwise_and(base, lab_gate)
     base = cv.morphologyEx(base, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)), 1)
     return base
+
+def fence_transparency(mask_u8: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Fill the vertical grid and gate gaps so the distant field stays connected."""
+    if not np.any(mask_u8):
+        return mask_u8
+
+    hor = cv.getStructuringElement(
+        cv.MORPH_RECT,
+        (max(3, int(round(w * FENCE_CLOSE_W)) | 1), max(3, int(round(h * FENCE_CLOSE_H)) | 1)),
+    )
+    filled = cv.morphologyEx(mask_u8, cv.MORPH_CLOSE, hor, 1)
+    soft = cv.morphologyEx(filled, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)), 1)
+
+    inv = cv.bitwise_not(soft)
+    num, labels, stats, _ = cv.connectedComponentsWithStats(inv, 8)
+    if num > 1:
+        max_hole = int(round(w * h * HOLE_FILL_R))
+        for lbl in range(1, num):
+            if stats[lbl, cv.CC_STAT_AREA] <= max_hole:
+                soft[labels == lbl] = 255
+    return soft
 
 def white_barrier(img_rgb: np.ndarray, green_mask_u8: np.ndarray) -> np.ndarray:
     """Detect white line that touches non-green region → dilate to 'moat' mask."""
@@ -100,6 +124,7 @@ def fb_field_detector(filename: str) -> None:
 
     img_eq = clahe_v(img)
     base   = green_mask(img_eq)
+    base   = fence_transparency(base, w, h)
     moat   = white_barrier(img_eq, base)
     base   = cv.bitwise_and(base, cv.bitwise_not(moat))
 
@@ -123,10 +148,14 @@ def fb_field_detector(filename: str) -> None:
     # Intersect with wide support for smoother lower edge under the fence
     hull_mask = np.zeros_like(conn_n); cv.fillPoly(hull_mask, [hull], 255)
     support = cv.dilate(conn_w, kpercent(w, h, 0.008, 0.008, ellipse=True), 1)
+    color_sup = cv.morphologyEx(base, cv.MORPH_CLOSE, kpercent(w, h, 0.012, 0.012, ellipse=True), 1)
     inter   = cv.bitwise_and(hull_mask, support)
+    inter   = cv.bitwise_and(inter, color_sup)
 
     # Final hull
     cnts, _ = cv.findContours(inter, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        cnts, _ = cv.findContours(hull_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     cnt  = max(cnts, key=cv.contourArea)
     final = cv.convexHull(cnt)
 
