@@ -4,11 +4,11 @@ import numpy as np
 
 # -------- Tunables (kept as constants for clarity) --------
 GREEN_HSV_LOW  = (35, 55, 35)    # green gate in HSV
-GREEN_HSV_HIGH = (95, 255, 255)
+GREEN_HSV_HIGH = (100, 255, 255)
 WHITE_HSV_LOW  = (0, 0, 175)     # white border (faint to bright)
 WHITE_HSV_HIGH = (180, 85, 255)
-BARRIER_KSIZE  = (5, 5)          # thickness of the 'moat' around white line
-EXG_BANDS      = 14              # horizontal bands for Otsu per band
+BARRIER_KSIZE  = (3, 3)          # thickness of the 'moat' around white line
+EXG_BANDS      = 30              # horizontal bands for Otsu per band
 BOTTOM_CUT_R   = 0.97            # cut a bottom strip to avoid floor leak
 CLAHE_CLIP     = 2.5             # V-channel equalization
 CLAHE_TILE     = (8, 8)
