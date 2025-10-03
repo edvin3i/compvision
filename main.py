@@ -374,6 +374,8 @@ def fb_field_detector(filename: str) -> None:
 # ==============================
 
 if __name__ == "__main__":
-    fb_field_detector("panorama_1.jpg")
-    fb_field_detector("panorama_frame_2.jpg")
-    fb_field_detector("panorama_frame_3.jpg")
+    #fb_field_detector("panorama_1.jpg")
+    #fb_field_detector("panorama_frame_2.jpg")
+    #fb_field_detector("panorama_frame_3.jpg")
+    #fb_field_detector("panorama_frame_50.jpg")
+    fb_field_detector("panorama_frame_51.jpg")
