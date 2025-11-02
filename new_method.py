@@ -133,8 +133,16 @@ def compute_green_chromaticity(img_rgb: np.ndarray, dbg: Optional[Debugger] = No
     return g
 
 
+def _gaussian_pdf(x: np.ndarray, mean: float, var: float) -> np.ndarray:
+    """Плотность одномерного нормального распределения."""
+    if var <= 0:
+        var = 1e-6
+    coeff = 1.0 / np.sqrt(2.0 * np.pi * var)
+    return coeff * np.exp(-0.5 * ((x - mean) ** 2) / var)
+
+
 def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
-                     dbg: Optional[Debugger] = None) -> Tuple[np.ndarray, np.ndarray]:
+                     dbg: Optional[Debugger] = None) -> Tuple[np.ndarray, np.ndarray, GaussianMixture, np.ndarray]:
     """
     Оценка плотности вероятности pdf(g) через смесь гауссиан (GMM).
 
@@ -149,24 +157,32 @@ def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
     Returns:
         pdf_values: Значения pdf для диапазона [0, 1]
         g_range: Значения g, для которых вычислена pdf
+        gmm: Обученная модель GMM
+        component_pdfs: Значения плотности для каждой компоненты на g_range
     """
     g_flat = g.flatten().reshape(-1, 1)
 
     # Обучение GMM с фиксированным random_state для воспроизводимости
-    gmm = GaussianMixture(n_components=n_components, random_state=42, max_iter=200)
+    gmm = GaussianMixture(
+        n_components=n_components, random_state=42, max_iter=200, covariance_type="full"
+    )
     gmm.fit(g_flat)
 
     # Вычисление pdf на диапазоне [0, 1]
-    g_range = np.linspace(0, 1, 1000).reshape(-1, 1)
-    log_prob = gmm.score_samples(g_range)
-    pdf_values = np.exp(log_prob)
+    g_range = np.linspace(0, 1, 1000)
+    component_pdfs = []
+    for weight, mean, cov in zip(gmm.weights_, gmm.means_.flatten(), gmm.covariances_.reshape(-1)):
+        component_pdfs.append(weight * _gaussian_pdf(g_range, mean, cov))
+
+    component_pdfs = np.stack(component_pdfs, axis=1)
+    pdf_values = np.sum(component_pdfs, axis=1)
 
     if dbg:
         try:
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(g_range, pdf_values, 'b-', linewidth=2, label='PDF(g)')
-            ax.hist(g_flat, bins=100, density=True, alpha=0.3, color='green', label='Histogram')
+            ax.hist(g_flat, bins=100, range=(0, 1), density=True, alpha=0.3, color='green', label='Histogram')
             ax.set_xlabel('Green Chromaticity (g)', fontsize=12)
             ax.set_ylabel('Probability Density', fontsize=12)
             ax.set_title('PDF estimated by GMM (K=4)', fontsize=14)
@@ -177,67 +193,71 @@ def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
         except ImportError:
             pass
 
-    return pdf_values.flatten(), g_range.flatten()
+    return pdf_values, g_range, gmm, component_pdfs
+
+
+def _find_local_minima(pdf_values: np.ndarray) -> np.ndarray:
+    """Поиск локальных минимумов в pdf."""
+    inverted_pdf = -pdf_values
+    prominence = max(np.max(pdf_values) * 0.02, 1e-3)
+    minima, _ = find_peaks(inverted_pdf, prominence=prominence)
+    return minima
 
 
 def find_threshold_from_pdf(pdf_values: np.ndarray, g_range: np.ndarray,
+                            gmm: GaussianMixture, component_pdfs: np.ndarray,
                             dbg: Optional[Debugger] = None) -> float:
     """
     Определение порога τ согласно алгоритму из статьи.
 
-    Алгоритм: τ = первый локальный минимум pdf(g) после первого пика,
-    расположенного выше g = 1/3.
+    Алгоритм следует описанию из статьи: выбирается первый локальный минимум
+    после перехода, когда компоненты со средним g > 1/3 начинают доминировать.
     """
-    # Находим ВСЕ пики, снижаем требования к prominence
-    peaks, properties = find_peaks(pdf_values, prominence=0.1, height=0.5)
+    threshold_g = 1.0 / 3.0
+    means = gmm.means_.flatten()
+    field_components = np.where(means > threshold_g)[0]
 
-    if len(peaks) == 0:
+    if len(field_components) == 0:
+        # Если не обнаружено ни одной компоненты с зелёными значениями,
+        # возвращаем безопасный порог
         return 0.4
 
-    threshold_g = 1.0 / 3.0
+    responsibilities = component_pdfs / np.maximum(pdf_values[:, np.newaxis], 1e-12)
+    field_resp = responsibilities[:, field_components].sum(axis=1)
+    non_field_resp = 1.0 - field_resp
 
-    # Находим ВСЕ пики выше порога 1/3
-    peaks_above_third = peaks[g_range[peaks] > threshold_g]
+    # Ищем первую точку, где вероятность «зелёных» компонентов превышает остальные
+    dominance_mask = (field_resp >= non_field_resp) & (g_range >= 0.15)
+    candidate_indices = np.where(dominance_mask)[0]
 
-    if len(peaks_above_third) == 0:
-        # Если нет пиков выше 1/3, берём первый значимый пик
-        first_peak = peaks[0]
+    if len(candidate_indices) == 0:
+        # fallback: ищем первый максимум соответствующей компоненты
+        candidate_indices = np.where(field_resp > 0.5)[0]
+
+    if len(candidate_indices) == 0:
+        return 0.4
+
+    transition_idx = candidate_indices[0]
+
+    # Находим локальные минимумы и выбираем ближайший после перехода
+    minima = _find_local_minima(pdf_values)
+    minima_after_transition = minima[minima >= max(0, transition_idx - 5)]
+
+    if len(minima_after_transition) > 0:
+        tau_idx = minima_after_transition[0]
     else:
-        # ВАЖНО: берём ПЕРВЫЙ пик выше 1/3, а не последний
-        first_peak = peaks_above_third[0]
+        tau_idx = transition_idx
 
-    # Находим минимумы с меньшими требованиями
-    inverted_pdf = -pdf_values
-    minima, _ = find_peaks(inverted_pdf, prominence=0.1)
-
-    # Находим первый минимум ПОСЛЕ выбранного пика
-    minima_after_peak = minima[(minima > first_peak) & (g_range[minima] < 0.9)]
-
-    if len(minima_after_peak) > 0:
-        tau_idx = minima_after_peak[0]
-        tau = g_range[tau_idx]
-    else:
-        # Альтернатива: ищем точку между пиками
-        if len(peaks) > 1 and first_peak < len(peaks) - 1:
-            next_peak = peaks[np.where(peaks > first_peak)[0][0]]
-            # Берём середину между пиками
-            tau_idx = (first_peak + next_peak) // 2
-            tau = g_range[tau_idx]
-        else:
-            # Fallback: немного правее первого пика
-            tau = min(g_range[first_peak] + 0.1, 0.5)
-
-    # Ограничения для разумного диапазона
-    tau = np.clip(tau, 0.25, 0.6)
+    tau = g_range[tau_idx]
+    tau = float(np.clip(tau, 0.2, 0.55))
 
     if dbg:
         try:
             import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(g_range, pdf_values, 'b-', linewidth=2, label='PDF(g)')
-            ax.plot(g_range[peaks], pdf_values[peaks], 'ro', markersize=8, label='Peaks')
             ax.axvline(x=threshold_g, color='gray', linestyle='--', alpha=0.5, label='g = 1/3')
-            ax.plot(g_range[first_peak], pdf_values[first_peak], 'go', markersize=12, label='Selected Peak')
+            minima = _find_local_minima(pdf_values)
             if len(minima) > 0:
                 ax.plot(g_range[minima], pdf_values[minima], 'mx', markersize=10, label='Minima')
             ax.axvline(x=tau, color='red', linestyle='-', linewidth=2, label=f'Threshold τ = {tau:.3f}')
@@ -248,6 +268,20 @@ def find_threshold_from_pdf(pdf_values: np.ndarray, g_range: np.ndarray,
             ax.grid(True, alpha=0.3)
             dbg.save_plot("04_threshold_selection", fig)
             plt.close(fig)
+
+            # Дополнительная визуализация вероятностей компонентов
+            if len(field_components) > 0:
+                fig2, ax2 = plt.subplots(figsize=(10, 6))
+                ax2.plot(g_range, field_resp, label='Field responsibility')
+                ax2.plot(g_range, non_field_resp, label='Non-field responsibility')
+                ax2.axvline(x=tau, color='red', linestyle='--', label=f'τ = {tau:.3f}')
+                ax2.set_xlabel('Green Chromaticity (g)', fontsize=12)
+                ax2.set_ylabel('Responsibility', fontsize=12)
+                ax2.set_title('Component responsibilities')
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+                dbg.save_plot("04b_responsibilities", fig2)
+                plt.close(fig2)
         except ImportError:
             pass
 
@@ -297,9 +331,7 @@ def partition_by_pdf_minima(g: np.ndarray, pdf_values: np.ndarray,
         segments: Список масок для каждого сегмента
         segment_ranges: Список диапазонов (g_min, g_max)
     """
-    # Находим минимумы с учетом prominence
-    inverted_pdf = -pdf_values
-    minima, _ = find_peaks(inverted_pdf, prominence=0.5)
+    minima = _find_local_minima(pdf_values)
 
     # Границы сегментов
     boundaries = [0] + list(g_range[minima]) + [1.0]
@@ -376,33 +408,34 @@ def compute_chromatic_distortion(img_rgb: np.ndarray, segment_mask: np.ndarray) 
 
 def is_narrow_peak_near_zero(cd_values: np.ndarray, gamma: float) -> bool:
     """
-    Проверка наличия узкого пика около нуля - МАКСИМАЛЬНО МЯГКИЕ критерии
-    для изображений с рыбьим глазом.
+    Проверка наличия узкого пика около нуля согласно рекомендациям статьи.
+
+    Гистограмма cd для «правильных» сегментов имеет узкий пик, расположенный
+    вблизи нуля и левее порога γ.
     """
     if len(cd_values) == 0:
         return False
 
-    # Используем персентили для устойчивости к выбросам
-    percentile_25 = np.percentile(cd_values, 25)
-    percentile_75 = np.percentile(cd_values, 75)
+    hist_range = (0, max(float(cd_values.max()), gamma * 3.0))
+    hist, bin_edges = np.histogram(cd_values, bins=64, range=hist_range)
+    if np.sum(hist) == 0:
+        return False
 
-    # Критерий 1: нижний квартиль должен быть близок к нулю
-    is_lower_quartile_low = percentile_25 < gamma * 0.8
+    max_bin = int(np.argmax(hist))
+    mode_center = 0.5 * (bin_edges[max_bin] + bin_edges[max_bin + 1])
 
-    # Критерий 2: хотя бы 35% значений < gamma (очень мягкий порог)
-    below_gamma_ratio = np.sum(cd_values < gamma) / len(cd_values)
-    is_concentrated = below_gamma_ratio > 0.35
+    perc70 = np.percentile(cd_values, 70)
+    perc90 = np.percentile(cd_values, 90)
 
-    # Критерий 3: межквартильный размах не слишком большой
-    iqr = percentile_75 - percentile_25
-    is_compact = iqr < gamma * 2
+    mode_ok = mode_center < gamma
+    concentrated = perc70 < gamma * 1.2 and perc90 < gamma * 2.0
 
-    return is_lower_quartile_low and (is_concentrated or is_compact)
+    return bool(mode_ok and concentrated)
 
 
 def filter_by_chromatic_distortion(img_rgb: np.ndarray, M1: np.ndarray, g: np.ndarray,
                                    pdf_values: np.ndarray, g_range: np.ndarray,
-                                   gamma: float = 0.25, dbg: Optional[Debugger] = None) -> np.ndarray:
+                                   gamma: float = 0.18, dbg: Optional[Debugger] = None) -> np.ndarray:
     """
     Фильтрация по хроматической дисторсии для удаления ложных срабатываний.
 
@@ -418,7 +451,7 @@ def filter_by_chromatic_distortion(img_rgb: np.ndarray, M1: np.ndarray, g: np.nd
         g: Массив значений зеленой хроматичности
         pdf_values: Значения pdf(g)
         g_range: Диапазон g для pdf
-        gamma: Порог для cd (увеличен до 0.15 для изображений с дисторсией)
+        gamma: Порог для cd (см. ограничение конуса на рис. 4 и Eq. (5) в статье)
         dbg: Объект для отладочного вывода
 
     Returns:
@@ -619,8 +652,8 @@ def detect_football_field(filename: str, skip_cd_filter: bool = False) -> None:
         print("[Stage 2] Pixel-level segmentation...")
 
     g = compute_green_chromaticity(img_preprocessed, dbg)
-    pdf_values, g_range = estimate_pdf_gmm(g, n_components=4, dbg=dbg)
-    tau = find_threshold_from_pdf(pdf_values, g_range, dbg)
+    pdf_values, g_range, gmm, component_pdfs = estimate_pdf_gmm(g, n_components=4, dbg=dbg)
+    tau = find_threshold_from_pdf(pdf_values, g_range, gmm, component_pdfs, dbg)
 
     if dbg:
         print(f"  Порог τ = {tau:.3f}")
@@ -636,7 +669,7 @@ def detect_football_field(filename: str, skip_cd_filter: bool = False) -> None:
         print("[Stage 3] Chromatic distortion filtering...")
 
     # Используем адаптивный gamma для изображений с дисторсией
-    gamma = 0.15  # Увеличено с 0.12 для учета искажений
+    gamma = 0.18  # См. анализ параметров γ в статье
     if skip_cd_filter:
         # Для изображений с сильной дисторсией пропускаем CD фильтрацию
         M2 = M1
@@ -709,7 +742,7 @@ if __name__ == "__main__":
 
     for img_file in images:
         try:
-            detect_football_field(img_file, skip_cd_filter=True)
+            detect_football_field(img_file, skip_cd_filter=False)
         except Exception as e:
             print(f"✗ Ошибка при обработке {img_file}: {str(e)}")
             import traceback
