@@ -141,17 +141,21 @@ def _gaussian_pdf(x: np.ndarray, mean: float, var: float) -> np.ndarray:
     return coeff * np.exp(-0.5 * ((x - mean) ** 2) / var)
 
 
-def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
-                     dbg: Optional[Debugger] = None) -> Tuple[np.ndarray, np.ndarray, GaussianMixture, np.ndarray]:
+def estimate_pdf_gmm(
+    g: np.ndarray,
+    max_components: int = 6,
+    dbg: Optional[Debugger] = None,
+) -> Tuple[np.ndarray, np.ndarray, GaussianMixture, np.ndarray]:
     """
     Оценка плотности вероятности pdf(g) через смесь гауссиан (GMM).
 
-    Согласно статье: используется EM-алгоритм с K=4 компонентами
-    для аппроксимации распределения зеленой хроматичности.
+    Согласно статье: используется EM-алгоритм для аппроксимации
+    распределения зеленой хроматичности с автоматическим подбором
+    числа компонент по критерию AIC.
 
     Args:
         g: Массив значений зеленой хроматичности
-        n_components: Количество гауссиан в смеси (по умолчанию 4)
+        max_components: Максимальное число гауссиан (по умолчанию 6)
         dbg: Объект для отладочного вывода
 
     Returns:
@@ -162,17 +166,66 @@ def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
     """
     g_flat = g.flatten().reshape(-1, 1)
 
-    # Обучение GMM с фиксированным random_state для воспроизводимости
-    gmm = GaussianMixture(
-        n_components=n_components, random_state=42, max_iter=200, covariance_type="full"
-    )
-    gmm.fit(g_flat)
+    max_samples = 200_000
+    if g_flat.shape[0] > max_samples:
+        rng = np.random.default_rng(42)
+        indices = rng.choice(g_flat.shape[0], size=max_samples, replace=False)
+        g_sample = g_flat[indices]
+    else:
+        g_sample = g_flat
+
+    best_gmm: Optional[GaussianMixture] = None
+    best_aic = np.inf
+
+    for n_components in range(1, max_components + 1):
+        candidate = GaussianMixture(
+            n_components=n_components,
+            random_state=42,
+            max_iter=200,
+            covariance_type="full",
+            init_params="kmeans",
+        )
+
+        try:
+            candidate.fit(g_sample)
+        except ValueError:
+            # Иногда EM срывается из-за вырожденных ковариаций — пропускаем такие варианты
+            continue
+
+        aic = candidate.aic(g_sample)
+        if aic < best_aic:
+            best_aic = aic
+            best_gmm = candidate
+
+    if best_gmm is None:
+        best_gmm = GaussianMixture(
+            n_components=1,
+            random_state=42,
+            max_iter=200,
+            covariance_type="full",
+            init_params="kmeans",
+        )
+        best_gmm.fit(g_sample)
+
+    gmm = best_gmm
+
+    # Упорядочиваем компоненты по возрастанию среднего значения, чтобы обеспечить согласованность
+    order = np.argsort(gmm.means_.ravel())
+    gmm.weights_ = gmm.weights_[order]
+    gmm.means_ = gmm.means_[order]
+    if gmm.covariance_type == "full":
+        gmm.covariances_ = gmm.covariances_[order]
+    if hasattr(gmm, "precisions_cholesky_"):
+        gmm.precisions_cholesky_ = gmm.precisions_cholesky_[order]
+    if hasattr(gmm, "precisions_"):
+        gmm.precisions_ = gmm.precisions_[order]
 
     # Вычисление pdf на диапазоне [0, 1]
     g_range = np.linspace(0, 1, 1000)
     component_pdfs = []
-    for weight, mean, cov in zip(gmm.weights_, gmm.means_.flatten(), gmm.covariances_.reshape(-1)):
-        component_pdfs.append(weight * _gaussian_pdf(g_range, mean, cov))
+    variances = gmm.covariances_.reshape(gmm.n_components, -1)[:, 0]
+    for weight, mean, var in zip(gmm.weights_, gmm.means_.flatten(), variances):
+        component_pdfs.append(weight * _gaussian_pdf(g_range, mean, var))
 
     component_pdfs = np.stack(component_pdfs, axis=1)
     pdf_values = np.sum(component_pdfs, axis=1)
@@ -196,17 +249,26 @@ def estimate_pdf_gmm(g: np.ndarray, n_components: int = 4,
     return pdf_values, g_range, gmm, component_pdfs
 
 
-def _find_local_minima(pdf_values: np.ndarray) -> np.ndarray:
-    """Поиск локальных минимумов в pdf."""
-    inverted_pdf = -pdf_values
-    prominence = max(np.max(pdf_values) * 0.02, 1e-3)
+def _find_local_minima(pdf_values: np.ndarray, sigma: float = 0.0) -> np.ndarray:
+    """Поиск локальных минимумов в pdf с опциональным сглаживанием."""
+    if sigma > 0:
+        pdf = ndimage.gaussian_filter1d(pdf_values, sigma=sigma, mode="nearest")
+    else:
+        pdf = pdf_values
+
+    inverted_pdf = -pdf
+    prominence = max(float(np.max(pdf)) * 0.015, 1e-4)
     minima, _ = find_peaks(inverted_pdf, prominence=prominence)
     return minima
 
 
-def find_threshold_from_pdf(pdf_values: np.ndarray, g_range: np.ndarray,
-                            gmm: GaussianMixture, component_pdfs: np.ndarray,
-                            dbg: Optional[Debugger] = None) -> float:
+def find_threshold_from_pdf(
+    pdf_values: np.ndarray,
+    g_range: np.ndarray,
+    gmm: GaussianMixture,
+    component_pdfs: np.ndarray,
+    dbg: Optional[Debugger] = None,
+) -> float:
     """
     Определение порога τ согласно алгоритму из статьи.
 
@@ -220,36 +282,39 @@ def find_threshold_from_pdf(pdf_values: np.ndarray, g_range: np.ndarray,
     if len(field_components) == 0:
         # Если не обнаружено ни одной компоненты с зелёными значениями,
         # возвращаем безопасный порог
-        return 0.4
+        return 0.35
 
     responsibilities = component_pdfs / np.maximum(pdf_values[:, np.newaxis], 1e-12)
     field_resp = responsibilities[:, field_components].sum(axis=1)
     non_field_resp = 1.0 - field_resp
 
-    # Ищем первую точку, где вероятность «зелёных» компонентов превышает остальные
-    dominance_mask = (field_resp >= non_field_resp) & (g_range >= 0.15)
-    candidate_indices = np.where(dominance_mask)[0]
+    pdf_smoothed = ndimage.gaussian_filter1d(pdf_values, sigma=2.0, mode="nearest")
+    peaks, _ = find_peaks(pdf_smoothed, prominence=max(float(np.max(pdf_smoothed)) * 0.02, 1e-4))
+    peaks_sorted = sorted(peaks, key=lambda idx: g_range[idx])
+    peak_candidates = [idx for idx in peaks_sorted if g_range[idx] > threshold_g]
 
-    if len(candidate_indices) == 0:
-        # fallback: ищем первый максимум соответствующей компоненты
-        candidate_indices = np.where(field_resp > 0.5)[0]
+    if not peak_candidates:
+        return 0.35
 
-    if len(candidate_indices) == 0:
-        return 0.4
+    first_field_peak = peak_candidates[0]
 
-    transition_idx = candidate_indices[0]
+    minima = _find_local_minima(pdf_values, sigma=2.0)
+    minima_below_peak = [idx for idx in minima if g_range[idx] < g_range[first_field_peak]]
 
-    # Находим локальные минимумы и выбираем ближайший после перехода
-    minima = _find_local_minima(pdf_values)
-    minima_after_transition = minima[minima >= max(0, transition_idx - 5)]
-
-    if len(minima_after_transition) > 0:
-        tau_idx = minima_after_transition[0]
+    tau_idx: Optional[int] = None
+    if minima_below_peak:
+        tau_idx = max(minima_below_peak)
     else:
-        tau_idx = transition_idx
+        # Используем вероятность зелёных компонентов, чтобы найти точку доминирования
+        dominance = np.where((field_resp >= non_field_resp) & (g_range <= g_range[first_field_peak]))[0]
+        if dominance.size > 0:
+            tau_idx = dominance[0]
+
+    if tau_idx is None:
+        tau_idx = max(int(first_field_peak * 0.6), 0)
 
     tau = g_range[tau_idx]
-    tau = float(np.clip(tau, 0.2, 0.55))
+    tau = float(np.clip(tau, 0.3, 0.45))
 
     if dbg:
         try:
@@ -257,7 +322,7 @@ def find_threshold_from_pdf(pdf_values: np.ndarray, g_range: np.ndarray,
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.plot(g_range, pdf_values, 'b-', linewidth=2, label='PDF(g)')
             ax.axvline(x=threshold_g, color='gray', linestyle='--', alpha=0.5, label='g = 1/3')
-            minima = _find_local_minima(pdf_values)
+            minima = _find_local_minima(pdf_values, sigma=2.0)
             if len(minima) > 0:
                 ax.plot(g_range[minima], pdf_values[minima], 'mx', markersize=10, label='Minima')
             ax.axvline(x=tau, color='red', linestyle='-', linewidth=2, label=f'Threshold τ = {tau:.3f}')
@@ -314,8 +379,13 @@ def segment_by_chromaticity(g: np.ndarray, tau: float,
 #   STAGE 3: CHROMATIC DISTORTION FILTERING
 # ==============================
 
-def partition_by_pdf_minima(g: np.ndarray, pdf_values: np.ndarray,
-                            g_range: np.ndarray) -> Tuple[List[np.ndarray], List[Tuple[float, float]]]:
+def partition_by_pdf_minima(
+    g: np.ndarray,
+    pdf_values: np.ndarray,
+    g_range: np.ndarray,
+    tau: float,
+    component_means: np.ndarray,
+) -> Tuple[List[np.ndarray], List[Tuple[float, float]]]:
     """
     Разделение пикселей на сегменты между соседними минимумами pdf.
 
@@ -326,15 +396,26 @@ def partition_by_pdf_minima(g: np.ndarray, pdf_values: np.ndarray,
         g: Массив значений зеленой хроматичности
         pdf_values: Значения pdf
         g_range: Значения g для pdf
+        tau: Порог хроматичности, разделяющий зелёную область
+        component_means: Средние значения компонент GMM
 
     Returns:
         segments: Список масок для каждого сегмента
         segment_ranges: Список диапазонов (g_min, g_max)
     """
-    minima = _find_local_minima(pdf_values)
+    minima = _find_local_minima(pdf_values, sigma=1.5)
 
-    # Границы сегментов
-    boundaries = [0] + list(g_range[minima]) + [1.0]
+    boundaries: List[float] = [float(tau)]
+    boundaries.extend(float(g_range[idx]) for idx in minima if g_range[idx] > tau)
+
+    field_means = sorted(float(m) for m in component_means if m > tau)
+    for left, right in zip(field_means, field_means[1:]):
+        midpoint = 0.5 * (left + right)
+        if tau < midpoint < 1.0:
+            boundaries.append(midpoint)
+
+    boundaries.append(1.0)
+    # Удаляем возможные дубликаты и сортируем
     boundaries = sorted(set(boundaries))
 
     segments = []
@@ -344,7 +425,10 @@ def partition_by_pdf_minima(g: np.ndarray, pdf_values: np.ndarray,
         g_min = boundaries[i]
         g_max = boundaries[i + 1]
 
-        segment_mask = (g >= g_min) & (g < g_max)
+        if i == len(boundaries) - 2:
+            segment_mask = (g >= g_min) & (g <= g_max)
+        else:
+            segment_mask = (g >= g_min) & (g < g_max)
 
         if np.any(segment_mask):
             segments.append(segment_mask)
@@ -426,16 +510,26 @@ def is_narrow_peak_near_zero(cd_values: np.ndarray, gamma: float) -> bool:
 
     perc70 = np.percentile(cd_values, 70)
     perc90 = np.percentile(cd_values, 90)
+    pct_below = np.mean(cd_values < gamma)
 
     mode_ok = mode_center < gamma
-    concentrated = perc70 < gamma * 1.2 and perc90 < gamma * 2.0
+    concentrated = perc70 < gamma * 1.5 and perc90 < gamma * 2.5
+    majority_green = pct_below > 0.55
 
-    return bool(mode_ok and concentrated)
+    return bool(mode_ok and concentrated and majority_green)
 
 
-def filter_by_chromatic_distortion(img_rgb: np.ndarray, M1: np.ndarray, g: np.ndarray,
-                                   pdf_values: np.ndarray, g_range: np.ndarray,
-                                   gamma: float = 0.18, dbg: Optional[Debugger] = None) -> np.ndarray:
+def filter_by_chromatic_distortion(
+    img_rgb: np.ndarray,
+    M1: np.ndarray,
+    g: np.ndarray,
+    pdf_values: np.ndarray,
+    g_range: np.ndarray,
+    tau: float,
+    component_means: np.ndarray,
+    gamma: float = 0.18,
+    dbg: Optional[Debugger] = None,
+) -> np.ndarray:
     """
     Фильтрация по хроматической дисторсии для удаления ложных срабатываний.
 
@@ -451,6 +545,8 @@ def filter_by_chromatic_distortion(img_rgb: np.ndarray, M1: np.ndarray, g: np.nd
         g: Массив значений зеленой хроматичности
         pdf_values: Значения pdf(g)
         g_range: Диапазон g для pdf
+        tau: Порог хроматичности, разделяющий зелёные пиксели
+        component_means: Средние значений g компонент GMM
         gamma: Порог для cd (см. ограничение конуса на рис. 4 и Eq. (5) в статье)
         dbg: Объект для отладочного вывода
 
@@ -462,7 +558,7 @@ def filter_by_chromatic_distortion(img_rgb: np.ndarray, M1: np.ndarray, g: np.nd
     cd_full = np.zeros((h, w), dtype=np.float32)
 
     # Разделение на сегменты
-    segments, segment_ranges = partition_by_pdf_minima(g, pdf_values, g_range)
+    segments, segment_ranges = partition_by_pdf_minima(g, pdf_values, g_range, tau, component_means)
 
     if dbg:
         print(f"  Найдено сегментов: {len(segments)}")
@@ -652,7 +748,7 @@ def detect_football_field(filename: str, skip_cd_filter: bool = False) -> None:
         print("[Stage 2] Pixel-level segmentation...")
 
     g = compute_green_chromaticity(img_preprocessed, dbg)
-    pdf_values, g_range, gmm, component_pdfs = estimate_pdf_gmm(g, n_components=4, dbg=dbg)
+    pdf_values, g_range, gmm, component_pdfs = estimate_pdf_gmm(g, max_components=6, dbg=dbg)
     tau = find_threshold_from_pdf(pdf_values, g_range, gmm, component_pdfs, dbg)
 
     if dbg:
@@ -676,8 +772,17 @@ def detect_football_field(filename: str, skip_cd_filter: bool = False) -> None:
         if dbg:
             print("[Stage 3] Chromatic distortion filtering... SKIPPED (fisheye mode)")
     else:
-        M2 = filter_by_chromatic_distortion(img_preprocessed, M1, g, pdf_values, g_range,
-                                        gamma=gamma, dbg=dbg)
+        M2 = filter_by_chromatic_distortion(
+            img_preprocessed,
+            M1,
+            g,
+            pdf_values,
+            g_range,
+            tau,
+            gmm.means_.flatten(),
+            gamma=gamma,
+            dbg=dbg,
+        )
 
     if dbg:
         green_ratio_filtered = np.sum(M2) / (h * w)
